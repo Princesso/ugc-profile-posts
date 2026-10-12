@@ -1,71 +1,144 @@
 import { NextResponse } from 'next/server'
+import { cloudinary, hasApiCredentials, requiredModerationKinds } from '../../lib/cloudinary-server'
 
-// This map will store the moderation results temporarily
-const moderationResults = new Map<string, { status: string, message: string }>()
+interface ModerationResult {
+  status: 'pending' | 'approved' | 'rejected'
+  message: string
+  publicId?: string
+  poorQuality?: boolean
+  approvedKinds: string[]
+}
 
-// This endpoint is used to catch the webhook sent from Cloudinary when the moderation 
-// is complete.  It is also used by the frontend to find out the moderation result for
-// a particular uploaded asset.
+// Moderation results are kept in memory until the frontend collects them. Storing the map on
+// globalThis keeps it alive across hot reloads in development. In a multi-instance deployment
+// (for example, serverless functions), replace this with a shared store such as Redis or a database.
+const globalStore = globalThis as unknown as { moderationResults?: Map<string, ModerationResult> }
+const moderationResults = (globalStore.moderationResults ??= new Map<string, ModerationResult>())
+
+const REJECTION_MESSAGES: Record<string, string> = {
+  aws_rek: 'Your image was rejected due to unsuitable content',
+  perception_point: 'Your image was rejected due to potential malware',
+}
+
+// Build a user-facing rejection message, including the top AI moderation label when there is one.
+function rejectionMessage(kind: string, response: any) {
+  const base = REJECTION_MESSAGES[kind] || 'Your image was rejected by moderation'
+  const label = response?.moderation_labels?.[0]
+  const labelName = label?.name || label?.parent_name
+  return labelName ? `${base} (${labelName})` : base
+}
+
+// Read the asset's tags to find out whether the upload preset's eval flagged it as poor quality.
+async function isPoorQuality(publicId: string) {
+  if (!hasApiCredentials) return false
+  try {
+    const resource = await cloudinary.api.resource(publicId)
+    return Array.isArray(resource.tags) && resource.tags.includes('poor_quality')
+  } catch (error) {
+    console.error('Could not read asset tags:', error)
+    return false
+  }
+}
+
+// Remove a rejected asset so it can never be delivered, and purge it from the CDN.
+async function deleteRejectedAsset(publicId: string) {
+  if (!hasApiCredentials) return
+  try {
+    await cloudinary.uploader.destroy(publicId, { invalidate: true })
+  } catch (error) {
+    console.error('Could not delete rejected asset:', error)
+  }
+}
+
+// Cloudinary signs every notification with your API secret. Reject anything that isn't signed.
+function isValidSignature(body: string, request: Request) {
+  if (!hasApiCredentials) {
+    console.warn('CLOUDINARY_API_SECRET is not set: skipping webhook signature verification')
+    return true
+  }
+  const timestamp = Number(request.headers.get('x-cld-timestamp'))
+  const signature = request.headers.get('x-cld-signature')
+  if (!timestamp || !signature) return false
+  return cloudinary.utils.verifyNotificationSignature(body, timestamp, signature)
+}
+
+// This endpoint catches the webhooks Cloudinary sends during the upload lifecycle.
+// Each moderation kind in the chain (e.g. aws_rek, then perception_point) sends its own
+// notification, and a moderation_summary is sent once the whole chain has finished.
 export async function POST(request: Request) {
+  const body = await request.text()
 
-  const data = await request.json()
-  
-  // Check if this is a webhook from Cloudinary
-  if (data.notification_type === 'moderation' || data.notification_type === 'moderation_summary') {
-    const { moderation_status, moderation_kind, asset_id } = data
+  if (!isValidSignature(body, request)) {
+    return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+  }
 
-    let status = 'pending'
-    let message = ''
-    
-    // Check the moderation status
-    if (moderation_status === 'rejected') {
-      status = 'rejected'
-      if (moderation_kind === 'aws_rek') {
-        message = 'Your image was rejected due to unsuitable content'
-      } else if (moderation_kind === 'perception_point') {
-        message = 'Your image was rejected due to potential malware'
-      }
-    } else if (moderation_status === 'approved') {
-      status = 'approved'
-      message = 'Image approved'
-    }
+  const data = JSON.parse(body)
 
-    // Store the result
-    moderationResults.set(asset_id, { status, message })
-
+  if (data.notification_type !== 'moderation' && data.notification_type !== 'moderation_summary') {
+    // Other notifications (such as the upload notification) aren't needed by this app.
     return NextResponse.json({ success: true })
   }
 
-  // If it's not a webhook, it's a request from our frontend
-  const { public_id, asset_id } = data
+  const { moderation_status, moderation_kind, moderation_response, asset_id, public_id } = data
+  const result: ModerationResult = moderationResults.get(asset_id) || {
+    status: 'pending',
+    message: '',
+    approvedKinds: [],
+  }
 
-  // Check if we have a moderation result for this asset
-  const moderationResult = moderationResults.get(asset_id)
+  // A rejection is final, so ignore anything that arrives afterwards.
+  if (result.status === 'rejected') {
+    return NextResponse.json({ success: true })
+  }
 
-  if (!moderationResult) {
+  if (moderation_status === 'rejected') {
+    result.status = 'rejected'
+    result.message = rejectionMessage(moderation_kind, moderation_response)
+    await deleteRejectedAsset(public_id)
+  } else if (moderation_status === 'approved') {
+    if (moderation_kind && !result.approvedKinds.includes(moderation_kind)) {
+      result.approvedKinds.push(moderation_kind)
+    }
+    const allKindsApproved = requiredModerationKinds.every(kind => result.approvedKinds.includes(kind))
+
+    if (result.status === 'pending' && (data.notification_type === 'moderation_summary' || allKindsApproved)) {
+      result.status = 'approved'
+      result.message = 'Image approved'
+      result.publicId = public_id
+      result.poorQuality = await isPoorQuality(public_id)
+    }
+  }
+
+  moderationResults.set(asset_id, result)
+  return NextResponse.json({ success: true })
+}
+
+// The frontend polls this endpoint to find out the moderation result for an uploaded asset.
+export async function GET(request: Request) {
+  const assetId = new URL(request.url).searchParams.get('asset_id')
+  if (!assetId) {
+    return NextResponse.json({ error: 'asset_id is required' }, { status: 400 })
+  }
+
+  const moderationResult = moderationResults.get(assetId)
+
+  if (!moderationResult || moderationResult.status === 'pending') {
     return NextResponse.json({ status: 'pending', message: 'Moderation in progress' })
   }
 
   // Clear the result from our temporary storage
-  moderationResults.delete(asset_id)
+  moderationResults.delete(assetId)
 
   if (moderationResult.status === 'approved') {
-
-    let poorQuality = false
-
-    if (data.tags && data.tags.includes('poor_quality')) {
-      poorQuality = true
-    }
- 
-    return NextResponse.json({ 
+    return NextResponse.json({
       status: 'approved',
-      poorQuality: poorQuality, 
-      publicId: public_id
-    })
-  } else {
-    return NextResponse.json({ 
-      status: 'rejected', 
-      message: moderationResult.message
+      poorQuality: moderationResult.poorQuality,
+      publicId: moderationResult.publicId,
     })
   }
+
+  return NextResponse.json({
+    status: 'rejected',
+    message: moderationResult.message,
+  })
 }
